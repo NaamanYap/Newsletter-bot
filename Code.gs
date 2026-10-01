@@ -900,6 +900,11 @@ const WIRE_ROOM_TEMPLATE = `<!DOCTYPE html>
   .brief-card{flex:0 0 min(250px,76%);display:flex;flex-direction:column;gap:8px;padding:16px 16px 18px;background:var(--panel);}
   .brief-fig{font-family:var(--serif);font-weight:600;font-size:32px;line-height:1;letter-spacing:-0.02em;color:var(--ink);}
   .brief-text{margin:0;font-size:13px;line-height:1.45;color:var(--ink-body);display:-webkit-box;-webkit-line-clamp:6;-webkit-box-orient:vertical;overflow:hidden;}
+  .brief-card[data-id]{cursor:pointer;}
+  .brief-card[data-id]:hover .brief-fig{color:var(--red);}
+  .brief-card[data-id]:focus-visible{outline:2px solid var(--blue);outline-offset:-2px;}
+  .brief-card.read .brief-fig, .brief-card.read .brief-text{color:var(--ink-muted);}
+  .feed .article.flash h3{color:var(--red);}
 
   .search-row{position:relative;margin:30px 0 8px;}
   .search-row svg{position:absolute;left:0;top:50%;transform:translateY(-50%);color:var(--ink-muted);}
@@ -1085,10 +1090,13 @@ const WIRE_ROOM_TEMPLATE = `<!DOCTYPE html>
     return out;
   }
 
+  // A hit with an id opens its story when tapped; hits from older digests have no story to open.
   function briefCard(h, duplicate){
-    var m = String(h).match(FIGURE_ONE);
-    return '<div class="brief-card"' + (duplicate ? ' aria-hidden="true"' : '') + '>' +
-      (m ? '<div class="brief-fig">' + esc(m[2]) + '</div>' : '') + '<p class="brief-text">' + esc(h) + '</p></div>';
+    var m = String(h.text).match(FIGURE_ONE);
+    return '<div class="brief-card' + (h.id && readSet.has(h.id) ? ' read' : '') + '"' +
+      (h.id ? ' data-id="' + h.id + '" role="button" tabindex="' + (duplicate ? '-1' : '0') + '"' : '') +
+      (duplicate ? ' aria-hidden="true"' : '') + '>' +
+      (m ? '<div class="brief-fig">' + esc(m[2]) + '</div>' : '') + '<p class="brief-text">' + esc(h.text) + '</p></div>';
   }
 
   // Aborted before each redraw so a refreshed digest doesn't stack a second animation on the first.
@@ -1098,9 +1106,52 @@ const WIRE_ROOM_TEMPLATE = `<!DOCTYPE html>
   function briefHits(){
     var items = allArticles();
     var perArticle = items.some(function(a){ return a.quickHit; });
-    if (!perArticle) return DIGEST.quickHits || [];
-    return items.map(function(a){ return a.quickHit || a.headline; });
+    if (!perArticle) return (DIGEST.quickHits || []).map(function(h){ return { text: h }; });
+    return items.map(function(a){ return { text: a.quickHit || a.headline, id: a.id }; });
   }
+
+  // Shows the story behind a quick hit: clears anything hiding it, opens it and scrolls it below the masthead.
+  function openStory(id){
+    var feed = document.getElementById('feed');
+    var el = feed.querySelector('.article[data-id="' + id + '"]');
+    if (!el){
+      searchTerm = '';
+      document.getElementById('searchInput').value = '';
+      currentFilter = 'ALL';
+      renderSectionNav();
+      renderFeed();
+      el = feed.querySelector('.article[data-id="' + id + '"]');
+      if (!el) return;
+    }
+    if (!el.classList.contains('expanded')) el.click();
+
+    var reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    var mastheadHeight = document.querySelector('.masthead').offsetHeight;
+    window.scrollTo({
+      top: el.getBoundingClientRect().top + window.pageYOffset - mastheadHeight - 12,
+      behavior: reduceMotion ? 'auto' : 'smooth'
+    });
+    el.focus({ preventScroll: true });
+    el.classList.add('flash');
+    setTimeout(function(){ el.classList.remove('flash'); }, 1600);
+  }
+
+  function markBriefRead(){
+    Array.prototype.forEach.call(document.querySelectorAll('.brief-card[data-id]'), function(card){
+      card.classList.toggle('read', readSet.has(card.dataset.id));
+    });
+  }
+
+  // Set once: the strip element stays put while its cards are redrawn on refresh.
+  var briefStrip = document.getElementById('brief');
+  briefStrip.addEventListener('click', function(e){
+    var card = e.target.closest('.brief-card[data-id]');
+    if (card) openStory(card.dataset.id);
+  });
+  briefStrip.addEventListener('keydown', function(e){
+    var card = e.target.closest('.brief-card[data-id]');
+    if (card && (e.key === 'Enter' || e.key === ' ')){ e.preventDefault(); openStory(card.dataset.id); }
+  });
 
   function renderBrief(){
     if (briefMotion){ briefMotion.abort(); briefMotion = null; }
@@ -1235,6 +1286,7 @@ const WIRE_ROOM_TEMPLATE = `<!DOCTYPE html>
     var items = allArticles();
     var read = items.filter(function(a){ return readSet.has(a.id); }).length;
     document.getElementById('readCount').textContent = read + ' of ' + items.length + ' read';
+    markBriefRead();
   }
 
   var focusIdx = 0;
