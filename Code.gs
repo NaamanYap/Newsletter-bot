@@ -1,13 +1,13 @@
 const CONFIG = {
   GEMINI_MODEL:    'gemini-2.5-flash',
   TRIGGER_HOUR:    8,
-  LOOKBACK_HOURS:  16,  // rolling window: each brief covers exactly this many hours before it runs
+  LOOKBACK_HOURS:  12,  // rolling window: each brief covers exactly this many hours before it runs
   MAX_EMAILS:      30,  // newest threads per Gmail search; high enough that a busy day doesn't push newsletters out
   MAX_BODY_CHARS:  12500,
   NOTIFY_EMAIL:    'naamanyap@gmail.com',
   ARCHIVE_FOLDER_NAME: 'Wire Room Digest Archive',
   // A Refresh tap within this many minutes of the last brief returns that brief instead of calling Gemini again.
-  MIN_REFRESH_MINUTES: 5,
+  MIN_REFRESH_MINUTES: 15,
   // Newsletter charts/photos, downloaded and shown to Gemini so it can match them to stories.
   MAX_IMAGES:          40,
   MIN_IMAGE_WIDTH:     150,      // images declared narrower than this (icons, headshots, pixels) are skipped

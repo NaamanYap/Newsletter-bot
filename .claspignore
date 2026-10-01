@@ -1,0 +1,4 @@
+# Only the script and its manifest go to Apps Script.
+**/**
+!Code.gs
+!appsscript.json
