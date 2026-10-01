@@ -15,6 +15,12 @@ const CONFIG = {
   MIN_IMAGE_BYTES:     2000,     // smaller downloads are tracking pixels or spacers, whatever their URL
   MAX_IMAGE_BYTES:     1500000,  // larger images are skipped, to keep the page quick to load
   MAX_GEMINI_IMAGE_BYTES: 12000000, // total image bytes sent to Gemini; its request limit is 20 MB
+  // Questions sent to the bot in Telegram are answered from the saved digests.
+  CHAT_HISTORY_DAYS:   7,        // how far back in the archive the bot looks
+  CHAT_FULL_HOURS:     24,       // digests this recent are given to Gemini in full; older ones as headlines
+  CHAT_MAX_CONTEXT_CHARS: 160000, // about 40k tokens of digest text per question
+  CHAT_MEMORY_TURNS:   6,        // earlier questions and answers kept for follow-ups
+  CHAT_MEMORY_MINUTES: 180,      // a conversation idle this long starts fresh
 };
 
 
@@ -356,9 +362,6 @@ function logNewsletterImages() {
 
 
 function summarizeWithGemini(emailContent, hasEmails, dateLabel, images) {
-  const apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
-  if (!apiKey) throw new Error('GEMINI_API_KEY not set in Script Properties.');
-
   var systemPrompt =
     'You are a Bloomberg newsletter document-generation assistant. ' +
     'The user will provide full Bloomberg newsletter contents for today. ' +
@@ -430,9 +433,16 @@ function summarizeWithGemini(emailContent, hasEmails, dateLabel, images) {
     }
   };
 
+  return JSON.parse(callGemini_(payload, 5).trim());
+}
+
+// Sends a generateContent request and returns the reply text, retrying while Gemini is busy.
+function callGemini_(payload, maxRetries) {
+  const apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+  if (!apiKey) throw new Error('GEMINI_API_KEY not set in Script Properties.');
+
   var apiEndpoint = 'https://generativelanguage.googleapis.com/v1beta/models/' + CONFIG.GEMINI_MODEL + ':generateContent?key=' + apiKey;
 
-  var maxRetries = 5;
   var baseDelay = 2000;
   var response, status;
 
@@ -468,7 +478,7 @@ function summarizeWithGemini(emailContent, hasEmails, dateLabel, images) {
 
   if (!rawText) throw new Error('Gemini response was empty or structural parsing failed.');
 
-  return JSON.parse(rawText.trim());
+  return rawText;
 }
 
 // ── DIGEST STORAGE (Drive) ──────────────────────────────────────
@@ -626,9 +636,14 @@ function getRefreshKey_() {
 }
 
 function isValidRefreshKey_(key) {
-  const given    = String(key || '');
-  const expected = getRefreshKey_();
-  if (given.length !== expected.length) return false;
+  return safeEquals_(key, getRefreshKey_());
+}
+
+// Compares secrets in constant time, so response timing doesn't reveal how much of a guess was right.
+function safeEquals_(given, expected) {
+  given    = String(given || '');
+  expected = String(expected || '');
+  if (!expected || given.length !== expected.length) return false;
   let diff = 0;
   for (let i = 0; i < given.length; i++) diff |= given.charCodeAt(i) ^ expected.charCodeAt(i);
   return diff === 0;
@@ -689,7 +704,6 @@ function sendDigestNotification(digest, dateLabel, hour, url) {
 }
 
 function sendTelegramMessage(botToken, chatId, text, replyMarkup) {
-  const url = 'https://api.telegram.org/bot' + botToken + '/sendMessage';
   const payload = {
     chat_id: chatId,
     text: text,
@@ -697,20 +711,336 @@ function sendTelegramMessage(botToken, chatId, text, replyMarkup) {
     disable_web_page_preview: true
   };
   if (replyMarkup) payload.reply_markup = replyMarkup;
+  telegramApi_(botToken, 'sendMessage', payload);
+}
 
-  const options = {
+function telegramApi_(botToken, method, payload) {
+  const response = UrlFetchApp.fetch('https://api.telegram.org/bot' + botToken + '/' + method, {
     method: 'post',
     contentType: 'application/json',
     payload: JSON.stringify(payload),
     muteHttpExceptions: true
-  };
-
-  const response = UrlFetchApp.fetch(url, options);
+  });
   const status = response.getResponseCode();
-
   if (status !== 200) {
     throw new Error(`Telegram error (HTTP ${status}): ${response.getContentText()}`);
   }
+  return JSON.parse(response.getContentText());
+}
+
+// ── ASK THE DIGEST (Telegram chat) ───────────────────────────────
+// Telegram posts each message you send the bot to this web app (see setupTelegramWebhook),
+// and the bot answers from the saved digests.
+
+const CHAT_HELP =
+  'Ask me anything about your Bloomberg digests. I read the last day in full and the past week\'s headlines.\n\n' +
+  'For example:\n' +
+  '• What\'s the latest on the Strait of Hormuz?\n' +
+  '• Why are Treasury yields rising?\n' +
+  '• Sum up today\'s tech news\n\n' +
+  'I remember our last few messages, so you can ask follow-ups. /new starts a fresh conversation.';
+
+function doPost(e) {
+  // Telegram ignores the reply body; Apps Script answers POSTs with a redirect either way.
+  const done = ContentService.createTextOutput('ok');
+  try {
+    const params = (e && e.parameter) || {};
+    if (!safeEquals_(params.hook, PropertiesService.getScriptProperties().getProperty('WEBHOOK_SECRET'))) return done;
+    const update = JSON.parse((e.postData && e.postData.contents) || '{}');
+    if (!claimUpdate_(update.update_id)) return done;
+    handleChatMessage_(update.message);
+  } catch (err) {
+    Logger.log('❌ Chat message failed: ' + err.message);
+  }
+  return done;
+}
+
+// Telegram counts Apps Script's redirect as a failed delivery and sends the update again,
+// so each update id is handled once. Retries arrive after the first delivery has finished.
+function claimUpdate_(updateId) {
+  if (typeof updateId !== 'number') return false;
+  const cache = CacheService.getScriptCache();
+  const key   = 'tg_update_' + updateId;
+  if (cache.get(key)) return false;
+  cache.put(key, '1', 21600); // the longest a cache entry lasts: 6 hours
+  return true;
+}
+
+function handleChatMessage_(message) {
+  if (!message || !message.chat) return;
+  const props    = PropertiesService.getScriptProperties();
+  const botToken = props.getProperty('TELEGRAM_BOT_TOKEN');
+  const chatId   = props.getProperty('TELEGRAM_CHAT_ID');
+  // The web app URL is public, so only your own chat gets answers.
+  if (!botToken || String(message.chat.id) !== String(chatId)) return;
+  // A retry older than the duplicate check above remembers is dropped rather than answered twice.
+  if (Date.now() / 1000 - message.date > 21600) return;
+
+  const text = String(message.text || '').trim();
+  const reply = function(html) { sendChatReply_(botToken, chatId, html, message.message_id); };
+
+  if (!text) return reply('I can only read text messages. Ask me about anything in your digests.');
+  if (/^\/(start|help)\b/i.test(text)) return reply(escapeHtml(CHAT_HELP));
+  if (/^\/new\b/i.test(text)) {
+    CacheService.getScriptCache().remove('chat_memory');
+    return reply('Started a new conversation. What would you like to know?');
+  }
+
+  try { telegramApi_(botToken, 'sendChatAction', { chat_id: chatId, action: 'typing' }); } catch (e) { /* cosmetic */ }
+  let answer;
+  try {
+    answer = formatChatAnswer_(answerQuestion_(text));
+  } catch (err) {
+    // The error stays in the log: some fetch errors quote the request URL, which holds the API key.
+    Logger.log('❌ Could not answer "' + text + '": ' + err.message);
+    answer = 'Sorry, I couldn’t answer that just now. Gemini may be busy, so try again in a minute.';
+  }
+  reply(answer);
+}
+
+function answerQuestion_(question) {
+  const memory = loadChatMemory_();
+  // Earlier questions count when picking stories, so "and what did China say?" still finds the topic.
+  const askedSoFar = memory.filter(function(m) { return m.role === 'user'; })
+    .map(function(m) { return m.text; }).concat([question]).join(' ');
+
+  const now = new Date();
+  const payload = {
+    systemInstruction: { parts: [{ text: chatSystemPrompt_(now) + '\n\n' + buildChatContext_(askedSoFar, now) }] },
+    contents: memory.concat([{ role: 'user', text: question }]).map(function(m) {
+      return { role: m.role, parts: [{ text: m.text }] };
+    }),
+    generationConfig: { temperature: 0.3 },
+  };
+  const answer = callGemini_(payload, 2).trim();
+
+  saveChatMemory_(memory.concat([{ role: 'user', text: question }, { role: 'model', text: answer }]));
+  return answer;
+}
+
+function chatSystemPrompt_(now) {
+  return 'You are the Wire Room desk: you answer the reader\'s questions about their Bloomberg newsletter digests ' +
+    'in a Telegram chat. It is now ' + formatDate(now, 'EEEE, MMMM d, yyyy HH:mm') + ' (' + Session.getScriptTimeZone() + ').\n\n' +
+    'RULES:\n' +
+    '- Answer only from the DIGESTS below: summaries of the reader\'s Bloomberg newsletters, newest first.\n' +
+    '- If the digests don\'t cover the question, say so plainly in one sentence. Don\'t fill the gap from general ' +
+    'knowledge, and never invent figures, names or dates.\n' +
+    '- Say when a fact is from, briefly, e.g. "(Sep 30, evening)". When digests disagree, go with the newer one ' +
+    'and mention the change if it matters.\n' +
+    '- Be brief: lead with the answer in 1-2 sentences, then up to 5 short bullets of supporting figures if useful. ' +
+    'Go longer only when asked to explain, compare or summarise.\n' +
+    '- Plain text for Telegram: no headings, tables or links. Start bullets with "• ". You may wrap a few key ' +
+    'figures or names in **double asterisks**.\n' +
+    '- Analysis is fine when asked ("is this bad for…?"), but base it on what the digests report and say it is ' +
+    'your reading. Don\'t tell the reader what to buy or sell.';
+}
+
+// The newest digest and any from the last CHAT_FULL_HOURS go in full. Older stories from the past week go in as headline +
+// quick hit, or in full when they mention a word from the question.
+function buildChatContext_(askedText, now) {
+  const fullSince = now.getTime() - CONFIG.CHAT_FULL_HOURS * 3600 * 1000;
+  const matches   = keywordMatcher_(askedText);
+  const seen      = {};
+  const blocks    = [];
+  let chars = 0;
+
+  recentDigestRecords_(CONFIG.CHAT_HISTORY_DAYS).forEach(function(r, i) {
+    // The newest digest always goes in full, even after a quiet day without new ones.
+    const allFull = i === 0 || new Date(r.generatedAt).getTime() >= fullSince;
+    const full = [], brief = [];
+    (r.digest.sections || []).forEach(function(s) {
+      (s.articles || []).forEach(function(a) {
+        // Newest first, so a story repeated in a later digest keeps only its latest version.
+        const key = String(a.headline || '').toLowerCase().trim();
+        if (!key || seen[key]) return;
+        seen[key] = true;
+        const head = '• [' + s.title + '] ' + a.headline;
+        const short = head + (a.quickHit ? ' — ' + a.quickHit : '');
+        full.push(allFull || matches(a.headline + ' ' + a.body) ? head + '\n  ' + a.body : short);
+        brief.push(short);
+      });
+    });
+    // Digests saved before stories carried their own quick hit keep them as a separate list.
+    const hits = (r.digest.quickHits || []).filter(function(h) { return !seen[h]; });
+    hits.forEach(function(h) { seen[h] = true; });
+    if (hits.length) {
+      const extra = 'Quick hits:\n' + hits.map(function(h) { return '• ' + h; }).join('\n');
+      full.push(extra);
+      brief.push(extra);
+    }
+    if (!full.length) return;
+
+    const title = '=== ' + r.edition + ' edition · ' + r.dateLabel + ', ' +
+      formatDate(new Date(r.generatedAt), 'HH:mm') + ' ===\n';
+    // When the full version doesn't fit, the headlines still might.
+    [full, brief].some(function(lines) {
+      const block = title + lines.join('\n') + '\n';
+      if (chars + block.length > CONFIG.CHAT_MAX_CONTEXT_CHARS) return false;
+      blocks.push(block);
+      chars += block.length;
+      return true;
+    });
+  });
+
+  return blocks.length
+    ? 'DIGESTS (newest first):\n\n' + blocks.join('\n')
+    : 'DIGESTS: none saved in the past ' + CONFIG.CHAT_HISTORY_DAYS + ' days.';
+}
+
+function recentDigestRecords_(days) {
+  const cutoff = Date.now() - days * 24 * 3600 * 1000;
+  const files  = getOrCreateArchiveFolder().getFiles();
+  const items  = [];
+  while (files.hasNext()) {
+    const f = files.next();
+    if (!/^digest_.*\.json$/.test(f.getName()) || f.getDateCreated().getTime() < cutoff) continue;
+    items.push({ file: f, created: f.getDateCreated() });
+  }
+  items.sort(function(a, b) { return b.created - a.created; });
+
+  return items.map(function(it) {
+    try {
+      const record = JSON.parse(it.file.getBlob().getDataAsString());
+      record.generatedAt = record.generatedAt || it.created.toISOString();
+      record.digest = record.digest || {};
+      return record;
+    } catch (e) {
+      Logger.log('⚠ Skipped unreadable digest ' + it.file.getName());
+      return null;
+    }
+  }).filter(Boolean);
+}
+
+const CHAT_STOPWORDS = (
+  'the and for are was were has have had not but with about what whats when where which who whom why how ' +
+  'does did doing done any all can could would should will this that these those there their them they then ' +
+  'than from into over after before more most some such tell give show explain latest news today yesterday ' +
+  'week happened happening going said says say its it\'s our you your just also very much many been being'
+).split(' ');
+
+// Matches text mentioning any meaningful word of the question; "tariff" also matches "tariffs".
+function keywordMatcher_(text) {
+  const words = String(text).toLowerCase().split(/[^a-z0-9]+/).filter(function(w, i, all) {
+    return w.length >= 3 && CHAT_STOPWORDS.indexOf(w) === -1 && all.indexOf(w) === i;
+  });
+  if (!words.length) return function() { return false; };
+  const re = new RegExp('\\b(' + words.join('|') + ')', 'i');
+  return function(s) { return re.test(String(s)); };
+}
+
+function loadChatMemory_() {
+  try { return JSON.parse(CacheService.getScriptCache().get('chat_memory') || '[]'); }
+  catch (e) { return []; }
+}
+
+function saveChatMemory_(memory) {
+  let kept = memory.slice(-CONFIG.CHAT_MEMORY_TURNS * 2);
+  // A cache value holds at most 100 KB; drop the oldest turns until it fits.
+  while (kept.length && JSON.stringify(kept).length > 90000) kept = kept.slice(2);
+  CacheService.getScriptCache().put('chat_memory', JSON.stringify(kept), CONFIG.CHAT_MEMORY_MINUTES * 60);
+}
+
+// Gemini writes plain text; this makes it safe for Telegram's HTML mode and turns **x** into bold.
+function formatChatAnswer_(text) {
+  return escapeHtml(text)
+    .replace(/^#+[ \t]*/gm, '')
+    .replace(/^[ \t]*[*-][ \t]+/gm, '• ')
+    .replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>');
+}
+
+// Long answers go out in several messages, split between paragraphs so bold tags stay whole.
+function sendChatReply_(botToken, chatId, html, replyToId) {
+  const chunks = [];
+  let current = '';
+  html.split(/\n{2,}/).forEach(function(para) {
+    while (para.length > 4000) { chunks.push(para.slice(0, 4000)); para = para.slice(4000); }
+    if (current && (current + '\n\n' + para).length > 4000) { chunks.push(current); current = ''; }
+    current = current ? current + '\n\n' + para : para;
+  });
+  if (current) chunks.push(current);
+
+  chunks.forEach(function(chunk, i) {
+    const payload = { chat_id: chatId, text: chunk, parse_mode: 'HTML', disable_web_page_preview: true };
+    if (i === 0) payload.reply_parameters = { message_id: replyToId, allow_sending_without_reply: true };
+    try {
+      telegramApi_(botToken, 'sendMessage', payload);
+    } catch (err) {
+      // A chunk cut mid-tag is rejected as HTML; send it as plain text instead.
+      delete payload.parse_mode;
+      payload.text = chunk.replace(/<\/?b>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+      telegramApi_(botToken, 'sendMessage', payload);
+    }
+  });
+}
+
+// ── TELEGRAM CHAT SETUP (run from the Apps Script editor) ───────
+
+// Connects the bot to this web app so it can answer your messages. Run once after deploying.
+function setupTelegramWebhook() {
+  connectTelegramWebhook_(false);
+}
+
+// Like setupTelegramWebhook, but takes the bot's messages even if another project receives them now.
+function replaceTelegramWebhook() {
+  connectTelegramWebhook_(true);
+}
+
+function connectTelegramWebhook_(replaceOther) {
+  requireEditor_();
+  const props    = PropertiesService.getScriptProperties();
+  const botToken = props.getProperty('TELEGRAM_BOT_TOKEN');
+  if (!botToken) throw new Error('TELEGRAM_BOT_TOKEN not set in Script Properties.');
+  const webAppUrl = getWebAppUrl().split('?')[0];
+  if (!webAppUrl) throw new Error('No web app URL. Set the WEBAPP_URL Script Property to the /exec URL first.');
+
+  // A bot delivers messages to one place only, so don't quietly take them from another project.
+  const current = (telegramApi_(botToken, 'getWebhookInfo', {}).result.url || '').split('?')[0];
+  if (current && current !== webAppUrl && !replaceOther) {
+    throw new Error('This bot already sends its messages to ' + current + '. Connecting the digest would cut ' +
+      'that off. If that is fine, run replaceTelegramWebhook instead.');
+  }
+
+  let secret = props.getProperty('WEBHOOK_SECRET');
+  if (!secret) {
+    secret = Utilities.getUuid().replace(/-/g, '') + Utilities.getUuid().replace(/-/g, '');
+    props.setProperty('WEBHOOK_SECRET', secret);
+  }
+  telegramApi_(botToken, 'setWebhook', {
+    url: webAppUrl + '?hook=' + secret,
+    allowed_updates: ['message'],
+    drop_pending_updates: true,
+  });
+  telegramApi_(botToken, 'setMyCommands', { commands: [
+    { command: 'new',  description: 'Start a new conversation' },
+    { command: 'help', description: 'What you can ask' },
+  ] });
+  Logger.log('✅ Connected. Send the bot a question in Telegram to try it.');
+}
+
+// Shows where the bot delivers messages and the last delivery error, for troubleshooting.
+function checkTelegramWebhook() {
+  requireEditor_();
+  const botToken = PropertiesService.getScriptProperties().getProperty('TELEGRAM_BOT_TOKEN');
+  const info = telegramApi_(botToken, 'getWebhookInfo', {}).result;
+  Logger.log('Delivers to: ' + ((info.url || '').split('?')[0] || '(nowhere — not connected)'));
+  Logger.log('Waiting to deliver: ' + info.pending_update_count);
+  if (info.last_error_message) {
+    Logger.log('Last error: ' + info.last_error_message + ' at ' + new Date(info.last_error_date * 1000));
+  }
+}
+
+// Stops the bot answering messages. Digests still arrive.
+function removeTelegramWebhook() {
+  requireEditor_();
+  const botToken = PropertiesService.getScriptProperties().getProperty('TELEGRAM_BOT_TOKEN');
+  telegramApi_(botToken, 'deleteWebhook', { drop_pending_updates: true });
+  Logger.log('🛑 The bot no longer answers messages.');
+}
+
+// The Wire Room page can call any function without "_" through google.script.run. Visitors are
+// anonymous there, so these setup functions refuse to run unless signed in, as in the editor.
+function requireEditor_() {
+  if (!Session.getActiveUser().getEmail()) throw new Error('Run this from the Apps Script editor.');
 }
 
 
