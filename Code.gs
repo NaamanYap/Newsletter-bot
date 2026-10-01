@@ -25,7 +25,9 @@ const CONFIG = {
 
 
 
-function generateBloombergBrief() {
+function generateBloombergBrief(e) {
+  // Checked before the try, so a refused call doesn't send a failure alert.
+  requireEditorOrTrigger_(e);
   try {
     Logger.log('▶ Bloomberg Brief generation started…');
 
@@ -37,7 +39,7 @@ function generateBloombergBrief() {
     const dateLabel = built.dateLabel;
     const file      = built.file;
 
-    const webAppUrl = getWebAppUrl();
+    const webAppUrl = getWebAppUrl_();
     if (!webAppUrl) {
       throw new Error(
         'No working web app URL. In the Apps Script editor: Deploy → Manage deployments → copy the ' +
@@ -51,23 +53,23 @@ function generateBloombergBrief() {
 
     // 4. Notify on Telegram with a teaser + link to the full reading page
     Logger.log('📤 Sending digest link to Telegram…');
-    sendDigestNotification(digest, dateLabel, hour, link);
+    sendDigestNotification_(digest, dateLabel, hour, link);
     Logger.log('✅ Done! Digest saved and link sent to Telegram.');
 
   } catch (err) {
     Logger.log('❌ Error: ' + err.message);
-    sendFailureAlert(err);
+    sendFailureAlert_(err);
     throw err;
   }
 }
 
 // Fetch → summarize → save. Shared by the scheduled briefs and the Wire Room's Refresh button.
 function buildDigest_(edition) {
-  const dateLabel = formatDate(new Date(), 'MMMM d, yyyy');
+  const dateLabel = formatDate_(new Date(), 'MMMM d, yyyy');
 
   // 1. Fetch Bloomberg emails
   Logger.log('📬 Searching Gmail for Bloomberg emails…');
-  const emails       = fetchBloombergEmails();
+  const emails       = fetchBloombergEmails_();
   const emailContent = emails.text;
   const hasEmails    = emailContent.trim().length > 100;
   Logger.log(hasEmails
@@ -80,17 +82,17 @@ function buildDigest_(edition) {
   // 2. Summarize with Gemini → structured digest JSON, then swap image ids for the real images and copy them to Drive
   Logger.log('🤖 Calling Gemini API…');
   const digest = saveImagesToDrive_(
-    attachImages_(summarizeWithGemini(emailContent, hasEmails, dateLabel, images), images), images);
+    attachImages_(summarizeWithGemini_(emailContent, hasEmails, dateLabel, images), images), images);
   Logger.log('✓ Digest generated with ' + (digest.sections || []).length + ' sections');
 
   // 3. Save the digest so it can be read as a webpage
   Logger.log('💾 Saving digest to Drive…');
-  const file = saveDigestRecord(digest, dateLabel, edition);
+  const file = saveDigestRecord_(digest, dateLabel, edition);
 
   return { digest: digest, dateLabel: dateLabel, file: file };
 }
 
-function fetchBloombergEmails() {
+function fetchBloombergEmails_() {
   const cutoff = new Date(Date.now() - CONFIG.LOOKBACK_HOURS * 60 * 60 * 1000);
   // Gmail reads a date-only after: as midnight Pacific time; seconds since 1970 give an exact, time-zone-free cutoff.
   const afterStr = String(Math.floor(cutoff.getTime() / 1000));
@@ -288,7 +290,7 @@ function saveImagesToDrive_(digest, images) {
   if (!articles.length) return digest;
 
   const folder = getOrCreateImageFolder_();
-  const stamp  = formatDate(new Date(), 'yyyy-MM-dd_HHmm');
+  const stamp  = formatDate_(new Date(), 'yyyy-MM-dd_HHmm');
   let saved = 0;
 
   articles.forEach(function(a, i) {
@@ -319,7 +321,7 @@ function getOrCreateImageFolder_() {
     }
   }
   // A subfolder, so the archive page (which lists the archive folder's own files) doesn't list images.
-  const parent   = getOrCreateArchiveFolder();
+  const parent   = getOrCreateArchiveFolder_();
   const existing = parent.getFoldersByName('Images');
   const folder   = existing.hasNext() ? existing.next() : parent.createFolder('Images');
   props.setProperty('IMAGE_FOLDER_ID', folder.getId());
@@ -350,7 +352,8 @@ function savedImageSrc_(image) {
 
 // Run from the editor to see which images would be offered to Gemini from the current lookback window.
 function logNewsletterImages() {
-  const images = downloadImages_(fetchBloombergEmails().images);
+  requireEditor_();
+  const images = downloadImages_(fetchBloombergEmails_().images);
   Logger.log(images.length + ' usable images:');
   images.forEach(function(img) {
     Logger.log(img.id + '  ' + img.blob.getContentType() + ', ' + Math.round(img.bytes / 1024) + ' KB  ' + img.src +
@@ -361,7 +364,7 @@ function logNewsletterImages() {
 
 
 
-function summarizeWithGemini(emailContent, hasEmails, dateLabel, images) {
+function summarizeWithGemini_(emailContent, hasEmails, dateLabel, images) {
   var systemPrompt =
     'You are a Bloomberg newsletter document-generation assistant. ' +
     'The user will provide full Bloomberg newsletter contents for today. ' +
@@ -483,7 +486,7 @@ function callGemini_(payload, maxRetries) {
 
 // ── DIGEST STORAGE (Drive) ──────────────────────────────────────
 
-function getOrCreateArchiveFolder() {
+function getOrCreateArchiveFolder_() {
   var props = PropertiesService.getScriptProperties();
   var folderId = props.getProperty('ARCHIVE_FOLDER_ID');
   if (folderId) {
@@ -499,8 +502,8 @@ function getOrCreateArchiveFolder() {
   return folder;
 }
 
-function saveDigestRecord(digest, dateLabel, edition) {
-  const folder  = getOrCreateArchiveFolder();
+function saveDigestRecord_(digest, dateLabel, edition) {
+  const folder  = getOrCreateArchiveFolder_();
   const tz      = Session.getScriptTimeZone();
   const stamp   = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd_HHmm');
   const fileName = 'digest_' + stamp + '_' + edition + '.json';
@@ -517,7 +520,7 @@ function saveDigestRecord(digest, dateLabel, edition) {
   return file;
 }
 
-function loadDigestRecord(fileId) {
+function loadDigestRecord_(fileId) {
   const id = fileId || PropertiesService.getScriptProperties().getProperty('LATEST_FILE_ID');
   if (!id) throw new Error('No digest has been generated yet. Run generateBloombergBrief first.');
   const file = DriveApp.getFileById(id);
@@ -526,7 +529,7 @@ function loadDigestRecord(fileId) {
   return record;
 }
 
-function getWebAppUrl() {
+function getWebAppUrl_() {
   // Prefer the saved /exec URL: when run from a time-driven trigger, ScriptApp.getService().getUrl()
   // can return the editor-only /dev test URL, which shows "unable to open the file" to anyone else.
   const savedUrl = PropertiesService.getScriptProperties().getProperty('WEBAPP_URL');
@@ -544,33 +547,33 @@ function doGet(e) {
   const refreshKey = isValidRefreshKey_(params.t) ? params.t : '';
   try {
     if (params.view === 'archive') {
-      return HtmlService.createHtmlOutput(renderArchiveHtml(refreshKey))
+      return HtmlService.createHtmlOutput(renderArchiveHtml_(refreshKey))
         .setTitle('Wire Room — Archive')
         .addMetaTag('viewport', 'width=device-width, initial-scale=1')
         .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
     }
-    const record = loadDigestRecord(params.id);
-    return HtmlService.createHtmlOutput(renderDigestHtml(record, refreshKey))
+    const record = loadDigestRecord_(params.id);
+    return HtmlService.createHtmlOutput(renderDigestHtml_(record, refreshKey))
       .setTitle('Wire Room — ' + record.dateLabel)
       .addMetaTag('viewport', 'width=device-width, initial-scale=1')
       // Telegram Desktop and Web show Mini Apps inside a frame, which Apps Script blocks by default.
       .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
   } catch (err) {
     return HtmlService.createHtmlOutput(
-      '<pre style="font-family:monospace;white-space:pre-wrap;padding:24px;">' + escapeHtml(err.message) + '</pre>'
+      '<pre style="font-family:monospace;white-space:pre-wrap;padding:24px;">' + escapeHtml_(err.message) + '</pre>'
     );
   }
 }
 
-function renderDigestHtml(record, refreshKey) {
+function renderDigestHtml_(record, refreshKey) {
   const page        = pageData_(record, false);
-  const archiveUrl  = getWebAppUrl() + '?view=archive' + (refreshKey ? '&t=' + refreshKey : '');
+  const archiveUrl  = getWebAppUrl_() + '?view=archive' + (refreshKey ? '&t=' + refreshKey : '');
   const dataJson    = JSON.stringify(page).split('</').join('<\\/');
 
   return WIRE_ROOM_TEMPLATE
-    .split('%%DATE_LABEL%%').join(escapeHtml(page.dateLabel))
-    .split('%%EDITION%%').join(escapeHtml(page.edition))
-    .split('%%UPDATED%%').join(escapeHtml(page.updatedLabel))
+    .split('%%DATE_LABEL%%').join(escapeHtml_(page.dateLabel))
+    .split('%%EDITION%%').join(escapeHtml_(page.edition))
+    .split('%%UPDATED%%').join(escapeHtml_(page.updatedLabel))
     .split('%%ARCHIVE_URL%%').join(archiveUrl)
     .split('%%STORAGE_KEY%%').join(page.fileId || 'latest')
     .split('%%REFRESH_KEY%%').join(refreshKey || '')
@@ -585,7 +588,7 @@ function pageData_(record, fresh) {
     quickHits:    digest.quickHits || [],
     dateLabel:    record.dateLabel || '',
     edition:      record.edition || '',
-    updatedLabel: record.generatedAt ? formatDate(new Date(record.generatedAt), 'HH:mm') : '',
+    updatedLabel: record.generatedAt ? formatDate_(new Date(record.generatedAt), 'HH:mm') : '',
     fileId:       record.fileId || '',
     fresh:        fresh,
   };
@@ -605,7 +608,7 @@ function refreshWireRoom(refreshKey) {
   }
   try {
     let latest = null;
-    try { latest = loadDigestRecord(); } catch (e) { /* no digest yet — build the first one */ }
+    try { latest = loadDigestRecord_(); } catch (e) { /* no digest yet — build the first one */ }
 
     const ageMinutes = latest && latest.generatedAt
       ? (Date.now() - new Date(latest.generatedAt).getTime()) / 60000
@@ -615,7 +618,7 @@ function refreshWireRoom(refreshKey) {
     Logger.log('▶ Live refresh requested from the Wire Room…');
     const built = buildDigest_('Live');
     Logger.log('✅ Live digest saved.');
-    return pageData_(loadDigestRecord(built.file.getId()), true);
+    return pageData_(loadDigestRecord_(built.file.getId()), true);
   } catch (err) {
     Logger.log('❌ Live refresh failed: ' + err.message);
     throw err;
@@ -649,8 +652,8 @@ function safeEquals_(given, expected) {
   return diff === 0;
 }
 
-function renderArchiveHtml(refreshKey) {
-  const folder = getOrCreateArchiveFolder();
+function renderArchiveHtml_(refreshKey) {
+  const folder = getOrCreateArchiveFolder_();
   const files  = folder.getFiles();
   const items  = [];
 
@@ -660,7 +663,7 @@ function renderArchiveHtml(refreshKey) {
   }
   items.sort(function(a, b) { return b.date - a.date; });
 
-  const baseUrl  = getWebAppUrl();
+  const baseUrl  = getWebAppUrl_();
   const keyParam = refreshKey ? '&t=' + refreshKey : '';
   const tz       = Session.getScriptTimeZone();
   const rows = items.map(function(it) {
@@ -668,7 +671,7 @@ function renderArchiveHtml(refreshKey) {
     const day     = Utilities.formatDate(it.date, tz, 'EEEE, MMMM d, yyyy');
     const time    = Utilities.formatDate(it.date, tz, 'HH:mm');
     return '<a class="row" href="' + baseUrl + '?id=' + it.id + keyParam + '">' +
-      '<span class="day">' + escapeHtml(day) + '</span>' +
+      '<span class="day">' + escapeHtml_(day) + '</span>' +
       '<span class="meta">' + edition + ' edition · ' + time + '</span></a>';
   }).join('');
 
@@ -679,7 +682,7 @@ function renderArchiveHtml(refreshKey) {
 
 // ── TELEGRAM NOTIFICATION ────────────────────────────────────────
 
-function sendDigestNotification(digest, dateLabel, hour, url) {
+function sendDigestNotification_(digest, dateLabel, hour, url) {
   const botToken = PropertiesService.getScriptProperties().getProperty('TELEGRAM_BOT_TOKEN');
   const chatId   = PropertiesService.getScriptProperties().getProperty('TELEGRAM_CHAT_ID');
   if (!botToken || !chatId) throw new Error('Missing Telegram credentials.');
@@ -695,15 +698,15 @@ function sendDigestNotification(digest, dateLabel, hour, url) {
 
   const text =
     '🍊 <b>BLOOMBERG DIGEST</b>\n' +
-    '📅 <i>' + escapeHtml(dateLabel) + '</i> — ' + edition + ' Edition\n' +
+    '📅 <i>' + escapeHtml_(dateLabel) + '</i> — ' + edition + ' Edition\n' +
     '📚 ' + sectionCount + ' sections · ' + articleCount + ' stories';
 
   // web_app opens the page as a Telegram Mini App panel; it only works in a private chat with the bot.
   const openButton = { inline_keyboard: [[{ text: '📖 Open Wire Room', web_app: { url: url } }]] };
-  sendTelegramMessage(botToken, chatId, text, openButton);
+  sendTelegramMessage_(botToken, chatId, text, openButton);
 }
 
-function sendTelegramMessage(botToken, chatId, text, replyMarkup) {
+function sendTelegramMessage_(botToken, chatId, text, replyMarkup) {
   const payload = {
     chat_id: chatId,
     text: text,
@@ -780,7 +783,7 @@ function handleChatMessage_(message) {
   const reply = function(html) { sendChatReply_(botToken, chatId, html, message.message_id); };
 
   if (!text) return reply('I can only read text messages. Ask me about anything in your digests.');
-  if (/^\/(start|help)\b/i.test(text)) return reply(escapeHtml(CHAT_HELP));
+  if (/^\/(start|help)\b/i.test(text)) return reply(escapeHtml_(CHAT_HELP));
   if (/^\/new\b/i.test(text)) {
     CacheService.getScriptCache().remove('chat_memory');
     return reply('Started a new conversation. What would you like to know?');
@@ -820,7 +823,7 @@ function answerQuestion_(question) {
 
 function chatSystemPrompt_(now) {
   return 'You are the Wire Room desk: you answer the reader\'s questions about their Bloomberg newsletter digests ' +
-    'in a Telegram chat. It is now ' + formatDate(now, 'EEEE, MMMM d, yyyy HH:mm') + ' (' + Session.getScriptTimeZone() + ').\n\n' +
+    'in a Telegram chat. It is now ' + formatDate_(now, 'EEEE, MMMM d, yyyy HH:mm') + ' (' + Session.getScriptTimeZone() + ').\n\n' +
     'RULES:\n' +
     '- Answer only from the DIGESTS below: summaries of the reader\'s Bloomberg newsletters, newest first.\n' +
     '- If the digests don\'t cover the question, say so plainly in one sentence. Don\'t fill the gap from general ' +
@@ -871,7 +874,7 @@ function buildChatContext_(askedText, now) {
     if (!full.length) return;
 
     const title = '=== ' + r.edition + ' edition · ' + r.dateLabel + ', ' +
-      formatDate(new Date(r.generatedAt), 'HH:mm') + ' ===\n';
+      formatDate_(new Date(r.generatedAt), 'HH:mm') + ' ===\n';
     // When the full version doesn't fit, the headlines still might.
     [full, brief].some(function(lines) {
       const block = title + lines.join('\n') + '\n';
@@ -889,7 +892,7 @@ function buildChatContext_(askedText, now) {
 
 function recentDigestRecords_(days) {
   const cutoff = Date.now() - days * 24 * 3600 * 1000;
-  const files  = getOrCreateArchiveFolder().getFiles();
+  const files  = getOrCreateArchiveFolder_().getFiles();
   const items  = [];
   while (files.hasNext()) {
     const f = files.next();
@@ -942,7 +945,7 @@ function saveChatMemory_(memory) {
 
 // Gemini writes plain text; this makes it safe for Telegram's HTML mode and turns **x** into bold.
 function formatChatAnswer_(text) {
-  return escapeHtml(text)
+  return escapeHtml_(text)
     .replace(/^#+[ \t]*/gm, '')
     .replace(/^[ \t]*[*-][ \t]+/gm, '• ')
     .replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>');
@@ -990,7 +993,7 @@ function connectTelegramWebhook_(replaceOther) {
   const props    = PropertiesService.getScriptProperties();
   const botToken = props.getProperty('TELEGRAM_BOT_TOKEN');
   if (!botToken) throw new Error('TELEGRAM_BOT_TOKEN not set in Script Properties.');
-  const webAppUrl = getWebAppUrl().split('?')[0];
+  const webAppUrl = getWebAppUrl_().split('?')[0];
   if (!webAppUrl) throw new Error('No web app URL. Set the WEBAPP_URL Script Property to the /exec URL first.');
 
   // A bot delivers messages to one place only, so don't quietly take them from another project.
@@ -1038,13 +1041,22 @@ function removeTelegramWebhook() {
 }
 
 // The Wire Room page can call any function without "_" through google.script.run. Visitors are
-// anonymous there, so these setup functions refuse to run unless signed in, as in the editor.
+// anonymous there, so the functions left callable for the editor refuse to run unless signed in.
 function requireEditor_() {
   if (!Session.getActiveUser().getEmail()) throw new Error('Run this from the Apps Script editor.');
 }
 
+// A scheduled run passes an event naming its trigger. A real trigger id is let through without relying on
+// the run having a signed-in user; a page visitor can't know one, so a visitor's call still needs the editor.
+function requireEditorOrTrigger_(e) {
+  const uid = e && e.triggerUid ? String(e.triggerUid) : '';
+  if (uid && ScriptApp.getProjectTriggers().some(function(t) { return t.getUniqueId() === uid; })) return;
+  requireEditor_();
+}
+
 
 function setupDailyTriggers() {
+  requireEditor_();
   removeDailyTriggers();
 
   // Morning Trigger: Set to 8:30 AM
@@ -1069,6 +1081,7 @@ function setupDailyTriggers() {
 }
 
 function removeDailyTriggers() {
+  requireEditor_();
   const triggers = ScriptApp.getProjectTriggers();
   for (let i = 0; i < triggers.length; i++) {
     if (triggers[i].getHandlerFunction() === 'generateBloombergBrief') {
@@ -1080,18 +1093,18 @@ function removeDailyTriggers() {
 
 // ── HELPERS ──────────────────────────────────────────────────
 
-function formatDate(date, pattern) {
+function formatDate_(date, pattern) {
   return Utilities.formatDate(date, Session.getScriptTimeZone(), pattern);
 }
 
-function escapeHtml(str) {
+function escapeHtml_(str) {
   return String(str)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
 }
 
-function sendFailureAlert(err) {
+function sendFailureAlert_(err) {
   const email = CONFIG.NOTIFY_EMAIL || '';
   if (!email) return;
   try {
