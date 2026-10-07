@@ -550,15 +550,12 @@ function doGet(e) {
       return HtmlService.createHtmlOutput(renderArchiveHtml_(refreshKey))
         .setTitle('Wire Room — Archive')
         .addMetaTag('viewport', 'width=device-width, initial-scale=1')
-        .addMetaTag('apple-mobile-web-app-title', 'Wire Room')
         .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
     }
     const record = loadDigestRecord_(params.id);
     return HtmlService.createHtmlOutput(renderDigestHtml_(record, refreshKey))
       .setTitle('Wire Room — ' + record.dateLabel)
       .addMetaTag('viewport', 'width=device-width, initial-scale=1')
-      // The name an iPhone home screen icon gets, instead of the dated page title.
-      .addMetaTag('apple-mobile-web-app-title', 'Wire Room')
       // Telegram Desktop and Web show Mini Apps inside a frame, which Apps Script blocks by default.
       .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
   } catch (err) {
