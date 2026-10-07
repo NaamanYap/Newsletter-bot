@@ -550,12 +550,15 @@ function doGet(e) {
       return HtmlService.createHtmlOutput(renderArchiveHtml_(refreshKey))
         .setTitle('Wire Room — Archive')
         .addMetaTag('viewport', 'width=device-width, initial-scale=1')
+        .addMetaTag('apple-mobile-web-app-title', 'Wire Room')
         .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
     }
     const record = loadDigestRecord_(params.id);
     return HtmlService.createHtmlOutput(renderDigestHtml_(record, refreshKey))
       .setTitle('Wire Room — ' + record.dateLabel)
       .addMetaTag('viewport', 'width=device-width, initial-scale=1')
+      // The name an iPhone home screen icon gets, instead of the dated page title.
+      .addMetaTag('apple-mobile-web-app-title', 'Wire Room')
       // Telegram Desktop and Web show Mini Apps inside a frame, which Apps Script blocks by default.
       .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
   } catch (err) {
@@ -741,7 +744,8 @@ const CHAT_HELP =
   '• What\'s the latest on the Strait of Hormuz?\n' +
   '• Why are Treasury yields rising?\n' +
   '• Sum up today\'s tech news\n\n' +
-  'I remember our last few messages, so you can ask follow-ups. /new starts a fresh conversation.';
+  'I remember our last few messages, so you can ask follow-ups. /new starts a fresh conversation.\n\n' +
+  '/link sends a link to the latest Wire Room that you can add to your home screen.';
 
 function doPost(e) {
   // Telegram ignores the reply body; Apps Script answers POSTs with a redirect either way.
@@ -788,6 +792,7 @@ function handleChatMessage_(message) {
     CacheService.getScriptCache().remove('chat_memory');
     return reply('Started a new conversation. What would you like to know?');
   }
+  if (/^\/link\b/i.test(text)) return reply(homeScreenLinkMessage_());
 
   try { telegramApi_(botToken, 'sendChatAction', { chat_id: chatId, action: 'typing' }); } catch (e) { /* cosmetic */ }
   let answer;
@@ -799,6 +804,20 @@ function handleChatMessage_(message) {
     answer = 'Sorry, I couldn’t answer that just now. Gemini may be busy, so try again in a minute.';
   }
   reply(answer);
+}
+
+// A link with no digest id always opens the newest edition, so it can live on a home screen.
+// The Mini App button can't be saved there; this plain link opens in the browser instead.
+function homeScreenLinkMessage_() {
+  const webAppUrl = getWebAppUrl_();
+  if (!webAppUrl) return 'There is no web app URL yet. Set the WEBAPP_URL Script Property to the /exec URL first.';
+  const url = webAppUrl + '?t=' + getRefreshKey_();
+  return '<a href="' + escapeHtml_(url) + '">📖 Wire Room — latest edition</a>\n\n' +
+    'It always opens the newest digest, with a working Refresh button. Keep it to yourself: ' +
+    'anyone with it can refresh.\n\n' +
+    'To add it to your home screen, tap the link, then open it in your browser (⋯ → Open in Safari/Chrome).\n' +
+    '• iPhone (Safari): Share → Add to Home Screen\n' +
+    '• Android (Chrome): ⋮ → Add to Home screen';
 }
 
 function answerQuestion_(question) {

@@ -64,7 +64,7 @@ To test immediately, run `generateBloombergBrief()` and watch the execution log.
 
 6. Ask the bot questions (optional)
 
-Message the bot in Telegram (e.g. *"what's the latest on oil?"*) and it answers from your saved digests: the newest ones in full, plus the past week's headlines. It remembers the last few messages for follow-ups; `/new` starts over.
+Message the bot in Telegram (e.g. *"what's the latest on oil?"*) and it answers from your saved digests: the newest ones in full, plus the past week's headlines. It remembers the last few messages for follow-ups; `/new` starts over. `/link` sends a link to the latest Wire Room that you can add to your phone's home screen.
 
 Deploy the web app (Execute as "Me", access "Anyone"), then run `setupTelegramWebhook()` once from the editor. It refuses if the bot already delivers its messages to another project; `replaceTelegramWebhook()` overrides that. `checkTelegramWebhook()` logs the delivery status, and `removeTelegramWebhook()` turns answering off. Only messages from `TELEGRAM_CHAT_ID` are answered.
 
