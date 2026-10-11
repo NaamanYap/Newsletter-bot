@@ -120,7 +120,7 @@ function fetchBloombergEmails_() {
         if (msg.getDate() < cutoff) return;
         const subject = msg.getSubject();
         const body    = msg.getPlainBody().substring(0, CONFIG.MAX_BODY_CHARS);
-        combined += '\n\n=== EMAIL ===\nSubject: ' + subject + '\n\n' + body + '\n';
+        combined += '\n\n=== EMAIL ===\nFrom: ' + msg.getFrom() + '\nSubject: ' + subject + '\n\n' + body + '\n';
 
         extractNewsletterImages_(msg.getBody(), subject).forEach(function(img) {
           if (seenSrcs[img.src] || images.length >= CONFIG.MAX_IMAGES) return;
@@ -397,7 +397,14 @@ function summarizeWithGemini_(emailContent, hasEmails, dateLabel, images) {
     '  ⚖️  BALANCE OF POWER\n' +
     '  📡  SURVEILLANCE\n' +
     '  🌿  ECONOMICS & GREEN\n' +
-    '  🏛️  POLITICS & POLICY\n\n' +
+    '  🏛️  POLITICS & POLICY\n' +
+    '  💼  BUSINESSWEEK\n' +
+    '  🗣️  OPINION\n' +
+    '  🌍  WEEKEND\n' +
+    '  🍸  PURSUITS\n' +
+    '  🌐  REGIONAL EDITIONS              (Singapore, Brussels, Chinese- and Japanese-language editions etc.; write in English)\n' +
+    'Use each email\'s From name and subject to tell which newsletter it is (e.g. "Bloomberg Businessweek", "Bloomberg Opinion", "Bloomberg Green"). ' +
+    'Every newsletter must appear somewhere: if one fits none of the sections above, add a section titled after that newsletter rather than dropping it.\n\n' +
     'RULES:\n' +
     '- articles per section: aim for 3-5 articles; never fewer than 2 if the section has content.\n' +
     '- article body: Provide an uncompromised deep dive of 5-8 analytical sentences. Include specific metrics, policy impacts, asset prices, and dates. Do not condense or skim over structural details.\n' +
