@@ -21,6 +21,18 @@ const CONFIG = {
   CHAT_MAX_CONTEXT_CHARS: 160000, // about 40k tokens of digest text per question
   CHAT_MEMORY_TURNS:   6,        // earlier questions and answers kept for follow-ups
   CHAT_MEMORY_MINUTES: 180,      // a conversation idle this long starts fresh
+  // Other outlets, read alongside the newsletters. Each one gets its own section in the digest.
+  // RSS feeds give headlines and short summaries; remove or add any feed here.
+  RSS_FEEDS: [
+    { name: 'BBC News',          url: 'https://feeds.bbci.co.uk/news/world/rss.xml' },
+    { name: 'BBC Business',      url: 'https://feeds.bbci.co.uk/news/business/rss.xml' },
+    { name: 'New York Times',    url: 'https://rss.nytimes.com/services/xml/rss/nyt/World.xml' },
+    { name: 'MarketWatch',       url: 'https://feeds.content.dowjones.io/public/rss/mw_topstories' },
+    { name: 'Financial Times',   url: 'https://www.ft.com/world?format=rss' },
+    { name: 'Al Jazeera',        url: 'https://www.aljazeera.com/xml/rss/all.xml' },
+  ],
+  MAX_FEED_ITEMS:      12,       // newest items kept per RSS feed
+  MAX_FEED_CHARS:      60000,    // total text from feeds given to Gemini
 };
 
 
@@ -74,7 +86,12 @@ function buildDigest_(edition) {
   const hasEmails    = emailContent.trim().length > 100;
   Logger.log(hasEmails
     ? '✓ Found Bloomberg emails (' + emailContent.length + ' chars, ' + emails.images.length + ' candidate images)'
-    : '⚠ No emails found — generating empty state');
+    : '⚠ No emails found');
+
+  Logger.log('📰 Reading news feeds…');
+  const feedContent = fetchNewsFeeds_();
+  const hasContent  = hasEmails || feedContent.length > 0;
+  if (!hasContent) Logger.log('⚠ Nothing found — generating empty state');
 
   // Download the candidates up front: Gemini matches them by looking at them, and the matches are copied to Drive.
   const images = hasEmails ? downloadImages_(emails.images) : [];
@@ -82,7 +99,7 @@ function buildDigest_(edition) {
   // 2. Summarize with Gemini → structured digest JSON, then swap image ids for the real images and copy them to Drive
   Logger.log('🤖 Calling Gemini API…');
   const digest = saveImagesToDrive_(
-    attachImages_(summarizeWithGemini_(emailContent, hasEmails, dateLabel, images), images), images);
+    attachImages_(summarizeWithGemini_(emailContent + feedContent, hasContent, dateLabel, images), images), images);
   Logger.log('✓ Digest generated with ' + (digest.sections || []).length + ' sections');
 
   // 3. Save the digest so it can be read as a webpage
@@ -133,6 +150,62 @@ function fetchBloombergEmails_() {
   });
 
   return { text: combined, images: images };
+}
+
+// ── NEWS FEEDS ───────────────────────────────────────────────────
+// Headlines from public RSS feeds, from the same LOOKBACK_HOURS window as the emails.
+// A source that fails is logged and skipped, so one broken feed never fails the brief.
+
+function fetchNewsFeeds_() {
+  const cutoff = new Date(Date.now() - CONFIG.LOOKBACK_HOURS * 60 * 60 * 1000);
+  const sources = CONFIG.RSS_FEEDS.map(function(feed) {
+    return { name: feed.name, request: { url: feed.url }, parse: parseRssItems_ };
+  });
+
+  if (!sources.length) return '';
+  const responses = UrlFetchApp.fetchAll(sources.map(function(src) {
+    return Object.assign({ muteHttpExceptions: true, followRedirects: true }, src.request);
+  }));
+
+  let combined = '';
+  sources.forEach(function(src, i) {
+    try {
+      const code = responses[i].getResponseCode();
+      if (code !== 200) throw new Error('HTTP ' + code);
+      const items = src.parse(responses[i].getContentText()).filter(function(item) {
+        return !item.date || item.date >= cutoff;
+      });
+      Logger.log('  ' + src.name + ': ' + items.length + ' items');
+      if (!items.length) return;
+      let block = '\n\n=== NEWS FEED ===\nSource: ' + src.name + '\n';
+      items.forEach(function(item) {
+        block += '\n- ' + item.title + (item.source ? ' (' + item.source + ')' : '') +
+          (item.byline ? '\n  By ' + item.byline : '') + (item.text ? '\n  ' + item.text : '') + '\n';
+      });
+      combined += block;
+    } catch (err) {
+      Logger.log('  ⚠ ' + src.name + ' skipped: ' + err.message);
+    }
+  });
+  return combined.substring(0, CONFIG.MAX_FEED_CHARS);
+}
+
+// Reads RSS 2.0 <item>s and Atom <entry>s.
+function parseRssItems_(xml) {
+  const root    = XmlService.parse(xml).getRootElement();
+  const atom    = XmlService.getNamespace('http://www.w3.org/2005/Atom');
+  const channel = root.getChild('channel');
+  const ns      = channel ? XmlService.getNoNamespace() : atom;
+  const nodes   = channel ? channel.getChildren('item') : root.getChildren('entry', atom);
+  return nodes.slice(0, CONFIG.MAX_FEED_ITEMS).map(function(node) {
+    const when = node.getChildText('pubDate', ns) || node.getChildText('published', ns) || node.getChildText('updated', ns);
+    const date = when ? new Date(when) : null;
+    return {
+      title: htmlToText_(node.getChildText('title', ns) || ''),
+      text:  htmlToText_(node.getChildText('description', ns) || node.getChildText('summary', ns) || ''),
+      date:  date && !isNaN(date) ? date : null,
+    };
+  }).filter(function(item) { return item.title; });
 }
 
 // ── NEWSLETTER IMAGES ────────────────────────────────────────────
@@ -404,7 +477,11 @@ function summarizeWithGemini_(emailContent, hasEmails, dateLabel, images) {
     '  🍸  PURSUITS\n' +
     '  🌐  REGIONAL EDITIONS              (Singapore, Brussels, Chinese- and Japanese-language editions etc.; write in English)\n' +
     'Use each email\'s From name and subject to tell which newsletter it is (e.g. "Bloomberg Businessweek", "Bloomberg Opinion", "Bloomberg Green"). ' +
-    'Every newsletter must appear somewhere: if one fits none of the sections above, add a section titled after that newsletter rather than dropping it.\n\n' +
+    'Every newsletter must appear somewhere: if one fits none of the sections above, add a section titled after that newsletter rather than dropping it.\n' +
+    'After the emails may come NEWS FEED blocks from the RSS feeds of other outlets. Give each feed\'s Source its own section after the Bloomberg ones, ' +
+    'titled with its name in capitals and the emoji 📰 (e.g. "📰 BBC NEWS", "📰 FINANCIAL TIMES"). ' +
+    'Feed items are often only a headline and a line or two: write article bodies only from what is given, shorter if needed, and never pad with outside knowledge. ' +
+    'Skip a feed item that repeats a story already covered; merge its new facts into that article instead.\n\n' +
     'RULES:\n' +
     '- articles per section: aim for 3-5 articles; never fewer than 2 if the section has content.\n' +
     '- article body: Provide an uncompromised deep dive of 5-8 analytical sentences. Include specific metrics, policy impacts, asset prices, and dates. Do not condense or skim over structural details.\n' +
@@ -423,7 +500,7 @@ function summarizeWithGemini_(emailContent, hasEmails, dateLabel, images) {
     : '';
 
   var userMsg = hasEmails
-    ? 'Today is ' + dateLabel + '. Summarize these Bloomberg emails into the ultra-detailed digest JSON:\n\n' + emailContent + imageList
+    ? 'Today is ' + dateLabel + '. Summarize these Bloomberg emails and news feeds into the ultra-detailed digest JSON:\n\n' + emailContent + imageList
     : 'No Bloomberg emails found for ' + dateLabel + '. Return an empty digest JSON structure with an empty sections array.';
 
   var parts = [{ text: systemPrompt + "\n\nUser Input Data:\n" + userMsg }];

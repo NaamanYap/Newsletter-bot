@@ -43,6 +43,8 @@ In the Apps Script editor, go to **Project Settings → Script Properties** and 
 | `TELEGRAM_BOT_TOKEN` | Token from BotFather |
 | `TELEGRAM_CHAT_ID` | Your chat ID |
 
+Besides the newsletters, each brief also reads the public RSS feeds listed in `CONFIG.RSS_FEEDS` (BBC, NYT, MarketWatch, FT, Al Jazeera) and gives each outlet its own section. Edit that list to change sources.
+
 4. Configure
 
 Edit the `CONFIG` block at the top of `Code.gs`:
