@@ -1,5 +1,6 @@
 const CONFIG = {
   GEMINI_MODEL:    'gemini-2.5-flash',
+  GEMINI_FALLBACK_MODEL: 'gemini-2.5-flash-lite', // used for the retries once the main model reports it is busy
   TRIGGER_HOUR:    8,
   LOOKBACK_HOURS:  12,  // rolling window: each brief covers exactly this many hours before it runs
   MAX_EMAILS:      30,  // newest threads per Gmail search; high enough that a busy day doesn't push newsletters out
@@ -31,7 +32,7 @@ const CONFIG = {
     { name: 'Financial Times',   url: 'https://www.ft.com/world?format=rss' },
     { name: 'Al Jazeera',        url: 'https://www.aljazeera.com/xml/rss/all.xml' },
   ],
-  MAX_FEED_ITEMS:      12,       // newest items kept per RSS feed
+  MAX_FEED_ITEMS:      8,        // newest items kept per RSS feed
   MAX_FEED_CHARS:      60000,    // total text from feeds given to Gemini
 };
 
@@ -528,12 +529,13 @@ function callGemini_(payload, maxRetries) {
   const apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
   if (!apiKey) throw new Error('GEMINI_API_KEY not set in Script Properties.');
 
-  var apiEndpoint = 'https://generativelanguage.googleapis.com/v1beta/models/' + CONFIG.GEMINI_MODEL + ':generateContent?key=' + apiKey;
+  var model = CONFIG.GEMINI_MODEL;
 
   var baseDelay = 2000;
   var response, status;
 
   for (var attempt = 0; attempt <= maxRetries; attempt++) {
+    var apiEndpoint = 'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent?key=' + apiKey;
     response = UrlFetchApp.fetch(apiEndpoint, {
       method:      'POST',
       contentType: 'application/json',
@@ -549,7 +551,9 @@ function callGemini_(payload, maxRetries) {
 
     if ((status === 503 || status === 429) && attempt < maxRetries) {
       var delayTime = baseDelay * Math.pow(2, attempt);
-      Logger.log('⚠️ Gemini server busy (HTTP ' + status + '). Retrying in ' + (delayTime / 1000) + 's... (Attempt ' + (attempt + 1) + '/' + maxRetries + ')');
+      // A busy model often stays busy for minutes; a lighter one usually answers straight away.
+      model = CONFIG.GEMINI_FALLBACK_MODEL || model;
+      Logger.log('⚠️ Gemini server busy (HTTP ' + status + '). Retrying with ' + model + ' in ' + (delayTime / 1000) + 's... (Attempt ' + (attempt + 1) + '/' + maxRetries + ')');
       Utilities.sleep(delayTime);
     } else {
       throw new Error('Gemini API returned HTTP ' + status + ': ' + response.getContentText().substring(0, 300));
