@@ -11,6 +11,7 @@ const CONFIG = {
   MIN_REFRESH_MINUTES: 15,
   // Newsletter charts/photos, downloaded and shown to Gemini so it can match them to stories.
   MAX_IMAGES:          40,
+  MAX_FEED_IMAGES:     30,       // pictures taken from news feed items, on top of the newsletter images
   MIN_IMAGE_WIDTH:     150,      // images declared narrower than this (icons, headshots, pixels) are skipped
   IMAGE_CONTEXT_CHARS: 240,      // text kept either side of an image, as a hint alongside the image itself
   MIN_IMAGE_BYTES:     2000,     // smaller downloads are tracking pixels or spacers, whatever their URL
@@ -90,12 +91,16 @@ function buildDigest_(edition) {
     : '⚠ No emails found');
 
   Logger.log('📰 Reading news feeds…');
-  const feedContent = fetchNewsFeeds_();
+  const feeds       = fetchNewsFeeds_();
+  const feedContent = feeds.text;
   const hasContent  = hasEmails || feedContent.length > 0;
   if (!hasContent) Logger.log('⚠ Nothing found — generating empty state');
 
   // Download the candidates up front: Gemini matches them by looking at them, and the matches are copied to Drive.
-  const images = hasEmails ? downloadImages_(emails.images) : [];
+  // Ids are numbered across both sources so Gemini sees one IMAGES list.
+  const candidates = emails.images.concat(feeds.images);
+  candidates.forEach(function(img, i) { img.id = 'img' + (i + 1); });
+  const images = candidates.length ? downloadImages_(candidates) : [];
 
   // 2. Summarize with Gemini → structured digest JSON, then swap image ids for the real images and copy them to Drive
   Logger.log('🤖 Calling Gemini API…');
@@ -163,12 +168,14 @@ function fetchNewsFeeds_() {
     return { name: feed.name, request: { url: feed.url }, parse: parseRssItems_ };
   });
 
-  if (!sources.length) return '';
+  if (!sources.length) return { text: '', images: [] };
   const responses = UrlFetchApp.fetchAll(sources.map(function(src) {
     return Object.assign({ muteHttpExceptions: true, followRedirects: true }, src.request);
   }));
 
-  let combined = '';
+  let combined   = '';
+  const images   = [];
+  const seenSrcs = {};
   sources.forEach(function(src, i) {
     try {
       const code = responses[i].getResponseCode();
@@ -182,13 +189,18 @@ function fetchNewsFeeds_() {
       items.forEach(function(item) {
         block += '\n- ' + item.title + (item.source ? ' (' + item.source + ')' : '') +
           (item.byline ? '\n  By ' + item.byline : '') + (item.text ? '\n  ' + item.text : '') + '\n';
+        if (item.image && !seenSrcs[item.image] && images.length < CONFIG.MAX_FEED_IMAGES) {
+          seenSrcs[item.image] = true;
+          images.push({ src: item.image, alt: '', subject: src.name, before: item.title,
+            after: (item.text || '').slice(0, CONFIG.IMAGE_CONTEXT_CHARS), feed: true });
+        }
       });
       combined += block;
     } catch (err) {
       Logger.log('  ⚠ ' + src.name + ' skipped: ' + err.message);
     }
   });
-  return combined.substring(0, CONFIG.MAX_FEED_CHARS);
+  return { text: combined.substring(0, CONFIG.MAX_FEED_CHARS), images: images };
 }
 
 // Reads RSS 2.0 <item>s and Atom <entry>s.
@@ -205,8 +217,33 @@ function parseRssItems_(xml) {
       title: htmlToText_(node.getChildText('title', ns) || ''),
       text:  htmlToText_(node.getChildText('description', ns) || node.getChildText('summary', ns) || ''),
       date:  date && !isNaN(date) ? date : null,
+      image: rssItemImage_(node, ns),
     };
   }).filter(function(item) { return item.title; });
+}
+
+// The item's own picture: the widest media:content/media:thumbnail, an image enclosure, or an <img> in its description.
+function rssItemImage_(node, ns) {
+  const media = XmlService.getNamespace('http://search.yahoo.com/mrss/');
+  const attr  = function(el, name) { const a = el.getAttribute(name); return a ? a.getValue() : ''; };
+  let best = '', bestWidth = -1;
+  const consider = function(el) {
+    const url = attr(el, 'url'), type = attr(el, 'type'), medium = attr(el, 'medium');
+    if (!/^https:\/\//i.test(url) || (type && !/^image\//i.test(type)) || (medium && medium !== 'image')) return;
+    const width = parseInt(attr(el, 'width'), 10) || 0;
+    if (width > bestWidth) { best = url; bestWidth = width; }
+  };
+  node.getChildren('content', media).forEach(consider);
+  node.getChildren('thumbnail', media).forEach(consider);
+  const group = node.getChild('group', media);
+  if (group) group.getChildren('content', media).forEach(consider);
+  node.getChildren('enclosure', ns).forEach(consider);
+  if (best) return best;
+
+  const html = node.getChildText('description', ns) || node.getChildText('summary', ns) || '';
+  const img  = html.match(/<img\b[^>]*>/i);
+  const src  = img ? decodeEntities_(htmlAttr_(img[0], 'src')) : '';
+  return /^https:\/\//i.test(src) ? src : '';
 }
 
 // ── NEWSLETTER IMAGES ────────────────────────────────────────────
@@ -274,7 +311,7 @@ function decodeEntities_(str) {
 
 function describeImagesForGemini_(images) {
   return images.map(function(img) {
-    return img.id + ' | email: "' + img.subject + '" | alt: "' + img.alt + '"' +
+    return img.id + (img.feed ? ' | feed: "' : ' | email: "') + img.subject + '" | alt: "' + img.alt + '"' +
       ' | text before: "' + img.before + '" | text after: "' + img.after + '"';
   }).join('\n');
 }
@@ -491,12 +528,12 @@ function summarizeWithGemini_(emailContent, hasEmails, dateLabel, images) {
     '- Do NOT fabricate or hallucinate numbers or events not present in the source emails.\n' +
     '- Preserve all significant stories — this is a comprehensive structural reference document.\n\n' +
     'IMAGES:\n' +
-    '- After the emails come the images found in them. Each one is labelled with its id (e.g. "Image img3:") and also listed under IMAGES with the email it came from, its alt text and the text around it.\n' +
+    '- After the emails come the images found in them and in the news feeds. Each one is labelled with its id (e.g. "Image img3:") and also listed under IMAGES with where it came from, its alt text and the text around it. For a feed image, "text before" is the headline of the feed item it belongs to.\n' +
     '- Look at each image itself: read a chart\'s title, labels and source, and recognise who or what a photo shows. Alt text and surrounding text are only hints; text next to an image often belongs to a neighbouring story.\n' +
-    '- Most articles will have no image. Add "image": "<id>" only when you can see the image shows that article\'s subject: a chart of the same data, or a photo of the same people, place, company or event. If in doubt, leave it out; no image is better than a wrong one.\n' +
+    '- Give as many articles an image as you reasonably can. Add "image": "<id>" when the image shows that article\'s subject: a chart of the same data, or a photo of the same people, place, company or event. A feed image fits any article covering that feed item\'s story. A closely related photo (the company\'s offices, the minister behind a policy) is fine; an image clearly about a different story is not.\n' +
     '- Use each image at most once. Never attach logos, ads, promos, author headshots or decorative images.';
 
-  var imageList = hasEmails && images && images.length
+  var imageList = hasEmails && images.length
     ? '\n\n=== IMAGES ===\n' + describeImagesForGemini_(images)
     : '';
 
