@@ -1,6 +1,6 @@
 const CONFIG = {
   GEMINI_MODEL:    'gemini-2.5-flash',
-  GEMINI_FALLBACK_MODEL: 'gemini-2.5-flash-lite', // used for the retries once the main model reports it is busy
+  GEMINI_FALLBACK_MODEL: 'gemini-2.5-flash-lite', // retries alternate with the main model while Gemini is busy
   TRIGGER_HOUR:    8,
   LOOKBACK_HOURS:  12,  // rolling window: each brief covers exactly this many hours before it runs
   MAX_EMAILS:      30,  // newest threads per Gmail search; high enough that a busy day doesn't push newsletters out
@@ -521,7 +521,7 @@ function summarizeWithGemini_(emailContent, hasEmails, dateLabel, images) {
     }
   };
 
-  return JSON.parse(callGemini_(payload, 5).trim());
+  return JSON.parse(callGemini_(payload, 8).trim());
 }
 
 // Sends a generateContent request and returns the reply text, retrying while Gemini is busy.
@@ -529,34 +529,46 @@ function callGemini_(payload, maxRetries) {
   const apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
   if (!apiKey) throw new Error('GEMINI_API_KEY not set in Script Properties.');
 
-  var model = CONFIG.GEMINI_MODEL;
+  // A busy model often stays busy for minutes, so retries alternate between the main and the lighter model
+  // rather than waiting on one that may be overloaded too.
+  var models = [CONFIG.GEMINI_MODEL];
+  if (CONFIG.GEMINI_FALLBACK_MODEL) models.push(CONFIG.GEMINI_FALLBACK_MODEL);
 
-  var baseDelay = 2000;
-  var response, status;
+  var baseDelay = 3000;
+  var maxDelay = 20000;
+  var response, status, errorText;
 
   for (var attempt = 0; attempt <= maxRetries; attempt++) {
+    // Attempt 0 uses the main model, attempt 1 the lighter one, and so on alternating.
+    var model = models[attempt % models.length];
     var apiEndpoint = 'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent?key=' + apiKey;
-    response = UrlFetchApp.fetch(apiEndpoint, {
-      method:      'POST',
-      contentType: 'application/json',
-      payload:     JSON.stringify(payload),
-      muteHttpExceptions: true,
-    });
-
-    status = response.getResponseCode();
+    try {
+      response = UrlFetchApp.fetch(apiEndpoint, {
+        method:      'POST',
+        contentType: 'application/json',
+        payload:     JSON.stringify(payload),
+        muteHttpExceptions: true,
+      });
+      status = response.getResponseCode();
+      errorText = status === 200 ? '' : response.getContentText().substring(0, 300);
+    } catch (e) {
+      // Timeouts and dropped connections surface as exceptions; treat them like a busy server.
+      status = 0;
+      errorText = String(e);
+    }
 
     if (status === 200) {
       break;
     }
 
-    if ((status === 503 || status === 429) && attempt < maxRetries) {
-      var delayTime = baseDelay * Math.pow(2, attempt);
-      // A busy model often stays busy for minutes; a lighter one usually answers straight away.
-      model = CONFIG.GEMINI_FALLBACK_MODEL || model;
-      Logger.log('⚠️ Gemini server busy (HTTP ' + status + '). Retrying with ' + model + ' in ' + (delayTime / 1000) + 's... (Attempt ' + (attempt + 1) + '/' + maxRetries + ')');
+    var retryable = status === 0 || status === 429 || status === 500 || status === 503 || status === 504;
+    if (retryable && attempt < maxRetries) {
+      // Exponential backoff with jitter, capped so the whole run stays well inside Apps Script's 6-minute limit.
+      var delayTime = Math.min(maxDelay, baseDelay * Math.pow(2, attempt)) + Math.floor(Math.random() * 1000);
+      Logger.log('⚠️ Gemini ' + model + ' failed (HTTP ' + status + '). Retrying in ' + Math.round(delayTime / 1000) + 's... (Attempt ' + (attempt + 1) + '/' + maxRetries + ')');
       Utilities.sleep(delayTime);
     } else {
-      throw new Error('Gemini API returned HTTP ' + status + ': ' + response.getContentText().substring(0, 300));
+      throw new Error('Gemini API returned HTTP ' + status + ' after ' + (attempt + 1) + ' attempt(s): ' + errorText);
     }
   }
 
